@@ -1,5 +1,10 @@
+#![allow(clippy::new_without_default)]
+#![allow(clippy::or_fun_call)]
+
 mod cache;
 mod cf;
+mod context;
+mod cors;
 mod date;
 pub mod durable;
 mod env;
@@ -12,6 +17,8 @@ mod request;
 mod request_init;
 mod response;
 mod router;
+mod schedule;
+mod websocket;
 
 #[doc(hidden)]
 use std::result::Result as StdResult;
@@ -19,6 +26,8 @@ use std::result::Result as StdResult;
 pub type Result<T> = StdResult<T, error::Error>;
 
 pub use crate::cache::Cache;
+pub use crate::context::Context;
+pub use crate::cors::Cors;
 pub use crate::date::{Date, DateInit};
 pub use crate::env::Env;
 pub use crate::error::Error;
@@ -30,10 +39,12 @@ pub use crate::request::Request;
 pub use crate::request_init::*;
 pub use crate::response::{Response, ResponseBody};
 pub use crate::router::{RouteContext, RouteParams, Router};
+pub use crate::schedule::*;
+pub use crate::websocket::*;
 pub use cf::Cf;
 pub use url::Url;
 
-pub use worker_sys::console_log;
+pub use worker_sys::{console_debug, console_error, console_log, console_warn};
 
 pub use crate::durable::*;
 pub use worker_macros::{durable_object, event};

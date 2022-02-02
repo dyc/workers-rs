@@ -1,10 +1,12 @@
+use crate::cors::Cors;
 use crate::error::Error;
 use crate::headers::Headers;
-use crate::Result;
+use crate::{Result, WebSocket};
 
+use js_sys::Uint8Array;
 use serde::{de::DeserializeOwned, Serialize};
 use wasm_bindgen_futures::JsFuture;
-use worker_sys::{Response as EdgeResponse, ResponseInit as EdgeResponseInit};
+use worker_sys::{response_init::ResponseInit as EdgeResponseInit, Response as EdgeResponse};
 
 #[derive(Debug)]
 pub enum ResponseBody {
@@ -22,6 +24,7 @@ pub struct Response {
     body: ResponseBody,
     headers: Headers,
     status_code: u16,
+    websocket: Option<WebSocket>,
 }
 
 impl Response {
@@ -36,6 +39,7 @@ impl Response {
                 body: ResponseBody::Body(data.into_bytes()),
                 headers,
                 status_code: 200,
+                websocket: None,
             });
         }
 
@@ -53,6 +57,7 @@ impl Response {
             body: ResponseBody::Body(data),
             headers,
             status_code: 200,
+            websocket: None,
         })
     }
 
@@ -66,16 +71,29 @@ impl Response {
             body: ResponseBody::Body(bytes),
             headers,
             status_code: 200,
+            websocket: None,
         })
     }
 
-    // Create a `Response` using a `ResponseBody` variant. Sets a status code of 200 and an empty
-    // set of Headers. Modify the Response with methods such as `with_status` and `with_headers`.
+    /// Create a `Response` using a `ResponseBody` variant. Sets a status code of 200 and an empty
+    /// set of Headers. Modify the Response with methods such as `with_status` and `with_headers`.
     pub fn from_body(body: ResponseBody) -> Result<Self> {
         Ok(Self {
             body,
             headers: Headers::new(),
             status_code: 200,
+            websocket: None,
+        })
+    }
+
+    /// Create a `Response` using a `WebSocket` client. Configures the browser to switch protocols
+    /// (using status code 101) and returns the websocket.
+    pub fn from_websocket(websocket: WebSocket) -> Result<Self> {
+        Ok(Self {
+            body: ResponseBody::Empty,
+            headers: Headers::new(),
+            status_code: 101,
+            websocket: Some(websocket),
         })
     }
 
@@ -89,6 +107,7 @@ impl Response {
             body: ResponseBody::Body(body.into().into_bytes()),
             headers,
             status_code: 200,
+            websocket: None,
         })
     }
 
@@ -98,6 +117,7 @@ impl Response {
             body: ResponseBody::Empty,
             headers: Headers::new(),
             status_code: 200,
+            websocket: None,
         })
     }
 
@@ -114,12 +134,13 @@ impl Response {
             body: ResponseBody::Body(msg.into().into_bytes()),
             headers: Headers::new(),
             status_code: status,
+            websocket: None,
         })
     }
 
     /// Create a `Response` which redirects to the specified URL with default status_code of 302
     pub fn redirect(url: url::Url) -> Result<Self> {
-        match EdgeResponse::redirect(&url.as_str()) {
+        match EdgeResponse::redirect(url.as_str()) {
             Ok(edge_response) => Ok(Response::from(edge_response)),
             Err(err) => Err(Error::from(err)),
         }
@@ -132,7 +153,7 @@ impl Response {
                 "redirect status codes must be in the 300-399 range! Please checkout https://developer.mozilla.org/en-US/docs/Web/HTTP/Status#redirection_messages for more".into(),
             ));
         }
-        match EdgeResponse::redirect_with_status(&url.as_str(), status_code) {
+        match EdgeResponse::redirect_with_status(url.as_str(), status_code) {
             Ok(edge_response) => Ok(Response::from(edge_response)),
             Err(err) => Err(Error::from(err)),
         }
@@ -171,9 +192,9 @@ impl Response {
         match &self.body {
             ResponseBody::Body(bytes) => Ok(bytes.clone()),
             ResponseBody::Empty => Ok(Vec::new()),
-            ResponseBody::Stream(response) => JsFuture::from(response.text()?)
+            ResponseBody::Stream(response) => JsFuture::from(response.array_buffer()?)
                 .await
-                .map(|value| value.as_string().unwrap().into_bytes())
+                .map(|value| js_sys::Uint8Array::new(&value).to_vec())
                 .map_err(Error::from),
         }
     }
@@ -189,6 +210,28 @@ impl Response {
     /// and will throw a JavaScript `RangeError`, returning a response with an HTTP 500 status code.
     pub fn with_status(mut self, status_code: u16) -> Self {
         self.status_code = status_code;
+        self
+    }
+
+    /// Sets this response's cors headers from the `Cors` struct.
+    /// Example usage:
+    /// ```
+    /// use worker::*;
+    /// fn fetch() -> worker::Result<Response> {
+    ///     let cors = Cors::default();
+    ///     Response::empty()?
+    ///         .with_cors(&cors)
+    /// }
+    /// ```
+    pub fn with_cors(mut self, cors: &Cors) -> Result<Self> {
+        cors.apply_headers(self.headers_mut())?;
+        Ok(self)
+    }
+
+    /// Sets this response's `webSocket` option.
+    /// This will require a status code 101 to work.
+    pub fn with_websocket(mut self, websocket: Option<WebSocket>) -> Self {
+        self.websocket = websocket;
         self
     }
 
@@ -213,6 +256,7 @@ fn no_using_invalid_error_status_code() {
 pub struct ResponseInit {
     pub status: u16,
     pub headers: Headers,
+    pub websocket: Option<WebSocket>,
 }
 
 impl From<ResponseInit> for EdgeResponseInit {
@@ -220,6 +264,9 @@ impl From<ResponseInit> for EdgeResponseInit {
         let mut edge_init = EdgeResponseInit::new();
         edge_init.status(init.status);
         edge_init.headers(&init.headers.0);
+        if let Some(websocket) = &init.websocket {
+            edge_init.websocket(websocket.as_ref());
+        }
         edge_init
     }
 }
@@ -227,21 +274,37 @@ impl From<ResponseInit> for EdgeResponseInit {
 impl From<Response> for EdgeResponse {
     fn from(res: Response) -> Self {
         match res.body {
-            ResponseBody::Body(mut bytes) => EdgeResponse::new_with_opt_u8_array_and_init(
-                Some(&mut bytes),
+            ResponseBody::Body(bytes) => {
+                let array = Uint8Array::new_with_length(bytes.len() as u32);
+                array.copy_from(&bytes);
+
+                EdgeResponse::new_with_opt_u8_array_and_init(
+                    Some(array),
+                    &ResponseInit {
+                        status: res.status_code,
+                        headers: res.headers,
+                        websocket: res.websocket,
+                    }
+                    .into(),
+                )
+                .unwrap()
+            }
+            ResponseBody::Stream(response) => EdgeResponse::new_with_opt_stream_and_init(
+                response.body(),
                 &ResponseInit {
                     status: res.status_code,
                     headers: res.headers,
+                    websocket: res.websocket,
                 }
                 .into(),
             )
             .unwrap(),
-            ResponseBody::Stream(response) => response,
             ResponseBody::Empty => EdgeResponse::new_with_opt_str_and_init(
                 None,
                 &ResponseInit {
                     status: res.status_code,
                     headers: res.headers,
+                    websocket: res.websocket,
                 }
                 .into(),
             )
@@ -255,6 +318,7 @@ impl From<EdgeResponse> for Response {
         Self {
             headers: Headers(res.headers()),
             status_code: res.status(),
+            websocket: res.websocket().map(|ws| ws.into()),
             body: match res.body() {
                 Some(_) => ResponseBody::Stream(res),
                 None => ResponseBody::Empty,

@@ -1,6 +1,4 @@
 use blake2::{Blake2b, Digest};
-use chrono;
-use cloudflare::framework::{async_api::Client, Environment, HttpApiClientConfig};
 use serde::{Deserialize, Serialize};
 use worker::*;
 
@@ -41,7 +39,6 @@ struct FileSize {
 
 struct SomeSharedData {
     regex: regex::Regex,
-    cloudflare_api_client: Client,
 }
 
 fn handle_a_request<D>(req: Request, _ctx: RouteContext<D>) -> Result<Response> {
@@ -49,7 +46,7 @@ fn handle_a_request<D>(req: Request, _ctx: RouteContext<D>) -> Result<Response> 
         "req at: {}, located at: {:?}, within: {}",
         req.path(),
         req.cf().coordinates().unwrap_or_default(),
-        req.cf().region().unwrap_or("unknown region".into())
+        req.cf().region().unwrap_or_else(|| "unknown region".into())
     ))
 }
 
@@ -58,24 +55,16 @@ async fn handle_async_request<D>(req: Request, _ctx: RouteContext<D>) -> Result<
         "[async] req at: {}, located at: {:?}, within: {}",
         req.path(),
         req.cf().coordinates().unwrap_or_default(),
-        req.cf().region().unwrap_or("unknown region".into())
+        req.cf().region().unwrap_or_else(|| "unknown region".into())
     ))
 }
 
 #[event(fetch)]
-pub async fn main(req: Request, env: Env) -> Result<Response> {
+pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
     utils::set_panic_hook();
-
-    let creds = cloudflare::framework::auth::Credentials::UserAuthToken {
-        token: env.secret("CF_API_TOKEN")?.to_string(),
-    };
-    let mut config = HttpApiClientConfig::default();
-    config.http_timeout = std::time::Duration::from_millis(500);
-    let client = Client::new(creds, config, Environment::Production).unwrap();
 
     let data = SomeSharedData {
         regex: regex::Regex::new(r"^\d{4}-\d{2}-\d{2}$").unwrap(),
-        cloudflare_api_client: client,
     };
 
     let router = Router::with_data(data); // if no data is needed, pass `()` or any other valid data
@@ -83,9 +72,36 @@ pub async fn main(req: Request, env: Env) -> Result<Response> {
     router
         .get("/request", handle_a_request) // can pass a fn pointer to keep routes tidy
         .get_async("/async-request", handle_async_request)
+        .get("/websocket", |_, _| {
+            // Accept / handle a websocket connection
+            let pair = WebSocketPair::new()?;
+            let server = pair.server;
+            server.accept()?;
+            server.send_with_str("Hi")?;
+            server.send_with_str("Other message")?;
+            let inner_server = server.clone();
+            server.on_message_async(move |event| {
+                let server = inner_server.clone();
+                async move {
+                    server
+                        .send_with_str(event.get_data().as_string().unwrap())
+                        .unwrap();
+                    console_log!("Message received");
+                }
+            })?;
+            server.on_close(|close| {
+                console_log!("{:?}", close);
+            })?;
+            server.on_error(|error| {
+                console_log!("{:?}", error);
+            })?;
+            Ok(Response::empty()?
+                .with_status(101)
+                .with_websocket(Some(pair.client)))
+        })
         .get("/test-data", |_, ctx| {
             // just here to test data works
-            if ctx.data().regex.is_match("2014-01-01") {
+            if ctx.data.regex.is_match("2014-01-01") {
                 Response::ok("data ok")
             } else {
                 Response::error("bad match", 500)
@@ -180,8 +196,8 @@ pub async fn main(req: Request, env: Env) -> Result<Response> {
         .get_async("/formdata-file-size/:hash", |_, ctx| async move {
             if let Some(hash) = ctx.param("hash") {
                 let kv = ctx.kv("FILE_SIZES")?;
-                return match kv.get(&hash).await? {
-                    Some(val) => Response::from_json(&val.as_json::<FileSize>()?),
+                return match kv.get(hash).json::<FileSize>().await? {
+                    Some(val) => Response::from_json(&val),
                     None => Response::error("Not Found", 404),
                 };
             }
@@ -254,22 +270,6 @@ pub async fn main(req: Request, env: Env) -> Result<Response> {
                 data.user_id, data.title, data.completed
             ))
         })
-        .get_async("/cloudflare-api", |_req, ctx| async move {
-            let resp = ctx
-                .data()
-                .cloudflare_api_client
-                .request_handle(&cloudflare::endpoints::user::GetUserDetails {})
-                .await
-                .unwrap();
-
-            Response::ok("hello user").map(|res| {
-                let mut headers = Headers::new();
-                headers
-                    .set("user-details-email", &resp.result.email)
-                    .unwrap();
-                res.with_headers(headers)
-            })
-        })
         .get_async("/proxy_request/*url", |_req, ctx| async move {
             let url = ctx.param("url").unwrap().strip_prefix('/').unwrap();
 
@@ -278,7 +278,10 @@ pub async fn main(req: Request, env: Env) -> Result<Response> {
         .get_async("/durable/:id", |_req, ctx| async move {
             let namespace = ctx.durable_object("COUNTER")?;
             let stub = namespace.id_from_name("A")?.get_stub()?;
-            stub.fetch_with_str("/").await
+            // when calling fetch to a Durable Object, a full URL must be used. Alternatively, a
+            // compatibility flag can be provided in wrangler.toml to opt-in to older behavior:
+            // https://developers.cloudflare.com/workers/platform/compatibility-dates#durable-object-stubfetch-requires-a-full-url
+            stub.fetch_with_str("https://fake-host/").await
         })
         .get("/secret", |_req, ctx| {
             Response::ok(ctx.secret("SOME_SECRET")?.to_string())
@@ -290,7 +293,7 @@ pub async fn main(req: Request, env: Env) -> Result<Response> {
             let kv = ctx.kv("SOME_NAMESPACE")?;
             if let Some(key) = ctx.param("key") {
                 if let Some(value) = ctx.param("value") {
-                    kv.put(&key, value)?.execute().await?;
+                    kv.put(key, value)?.execute().await?;
                 }
             }
 
@@ -310,10 +313,7 @@ pub async fn main(req: Request, env: Env) -> Result<Response> {
             Response::from_bytes(serde_json::to_vec(&todo)?)
         })
         .post_async("/nonsense-repeat", |_, ctx| async move {
-            //  just here to test data works, and verify borrow
-            let _d = ctx.data();
-
-            if ctx.data().regex.is_match("2014-01-01") {
+            if ctx.data.regex.is_match("2014-01-01") {
                 Response::ok("data ok")
             } else {
                 Response::error("bad match", 500)
@@ -363,7 +363,7 @@ pub async fn main(req: Request, env: Env) -> Result<Response> {
         .get("/now", |_, _| {
             let now = chrono::Utc::now();
             let js_date: Date = now.into();
-            Response::ok(format!("{}", js_date.to_string()))
+            Response::ok(js_date.to_string())
         })
         .get("/custom-response-body", |_, _| {
             Response::from_body(ResponseBody::Body(vec![b'h', b'e', b'l', b'l', b'o']))

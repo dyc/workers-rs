@@ -53,5 +53,14 @@ extern "C" {
     pub fn caches(this: &WorkerGlobalScope) -> Caches;
 
     #[wasm_bindgen(js_namespace = console)]
+    pub fn debug(s: &str);
+
+    #[wasm_bindgen(js_namespace = console)]
     pub fn log(s: &str);
+
+    #[wasm_bindgen(js_namespace = console)]
+    pub fn warn(s: &str);
+
+    #[wasm_bindgen(js_namespace = console)]
+    pub fn error(s: &str);
 }
