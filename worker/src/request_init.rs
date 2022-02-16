@@ -169,6 +169,7 @@ impl From<&CfProperties> for JsValue {
             &JsValue::from(
                 props
                     .cache_key
+                    .clone()
                     .unwrap_or(defaults.cache_key.unwrap_or_default()),
             ),
         );
