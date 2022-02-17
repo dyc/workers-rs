@@ -1,7 +1,8 @@
 use crate::cors::Cors;
 use crate::error::Error;
 use crate::headers::Headers;
-use crate::{Result, WebSocket};
+use crate::Result;
+use crate::WebSocket;
 
 use js_sys::Uint8Array;
 use serde::{de::DeserializeOwned, Serialize};
@@ -199,6 +200,11 @@ impl Response {
         }
     }
 
+    // Get the WebSocket returned by the the server.
+    pub fn websocket(self) -> Option<WebSocket> {
+        self.websocket
+    }
+
     /// Set this response's `Headers`.
     pub fn with_headers(mut self, headers: Headers) -> Self {
         self.headers = headers;
@@ -223,9 +229,10 @@ impl Response {
     ///         .with_cors(&cors)
     /// }
     /// ```
-    pub fn with_cors(mut self, cors: &Cors) -> Result<Self> {
-        cors.apply_headers(self.headers_mut())?;
-        Ok(self)
+    pub fn with_cors(self, cors: &Cors) -> Result<Self> {
+        let mut headers = self.headers.clone();
+        cors.apply_headers(&mut headers)?;
+        Ok(self.with_headers(headers))
     }
 
     /// Sets this response's `webSocket` option.
