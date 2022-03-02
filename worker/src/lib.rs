@@ -18,6 +18,7 @@ mod request_init;
 mod response;
 mod router;
 mod schedule;
+mod streams;
 mod websocket;
 
 #[doc(hidden)]
@@ -40,6 +41,7 @@ pub use crate::request_init::*;
 pub use crate::response::{Response, ResponseBody};
 pub use crate::router::{RouteContext, RouteParams, Router};
 pub use crate::schedule::*;
+pub use crate::streams::*;
 pub use crate::websocket::*;
 pub use cf::Cf;
 pub use url::Url;

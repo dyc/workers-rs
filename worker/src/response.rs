@@ -1,11 +1,18 @@
 use crate::cors::Cors;
 use crate::error::Error;
 use crate::headers::Headers;
-use crate::{Result, WebSocket};
+use crate::ByteStream;
+use crate::Result;
+use crate::WebSocket;
 
+use futures::TryStream;
+use futures::TryStreamExt;
 use js_sys::Uint8Array;
 use serde::{de::DeserializeOwned, Serialize};
+use wasm_bindgen::JsCast;
+use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
+use web_sys::ReadableStream;
 use worker_sys::{response_init::ResponseInit as EdgeResponseInit, Response as EdgeResponse};
 
 #[derive(Debug)]
@@ -95,6 +102,33 @@ impl Response {
             status_code: 101,
             websocket: Some(websocket),
         })
+    }
+
+    /// Create a `Response` using a [`Stream`](futures::stream::Stream) for the body. Sets a status
+    /// code of 200 and an empty set of Headers. Modify the Response with methods such as
+    /// `with_status` and `with_headers`.
+    pub fn from_stream<S>(stream: S) -> Result<Self>
+    where
+        S: TryStream + 'static,
+        S::Ok: Into<Vec<u8>>,
+        S::Error: Into<Error>,
+    {
+        let js_stream = stream
+            .map_ok(|item| -> Vec<u8> { item.into() })
+            .map_ok(|chunk| {
+                let array = Uint8Array::new_with_length(chunk.len() as _);
+                array.copy_from(&chunk);
+
+                array.into()
+            })
+            .map_err(|err| -> crate::Error { err.into() })
+            .map_err(|e| JsValue::from(e.to_string()));
+
+        let stream = wasm_streams::ReadableStream::from_stream(js_stream);
+        let stream: ReadableStream = stream.into_raw().dyn_into().unwrap();
+
+        let edge_res = EdgeResponse::new_with_opt_stream(Some(&stream))?;
+        Ok(Self::from(edge_res))
     }
 
     /// Create a `Response` using unprocessed text provided. Sets the associated `Content-Type`
@@ -199,6 +233,28 @@ impl Response {
         }
     }
 
+    /// Access this response's body as a [`Stream`](futures::stream::Stream) of bytes.
+    pub fn stream(&mut self) -> Result<ByteStream> {
+        let edge_request = match &self.body {
+            ResponseBody::Stream(edge_request) => edge_request,
+            _ => return Err(Error::RustError("body is not streamable".into())),
+        };
+
+        let stream = edge_request
+            .body()
+            .ok_or_else(|| Error::RustError("no body for request".into()))?;
+
+        let stream = wasm_streams::ReadableStream::from_raw(stream.dyn_into().unwrap());
+        Ok(ByteStream {
+            inner: stream.into_stream(),
+        })
+    }
+
+    // Get the WebSocket returned by the the server.
+    pub fn websocket(self) -> Option<WebSocket> {
+        self.websocket
+    }
+
     /// Set this response's `Headers`.
     pub fn with_headers(mut self, headers: Headers) -> Self {
         self.headers = headers;
@@ -223,9 +279,10 @@ impl Response {
     ///         .with_cors(&cors)
     /// }
     /// ```
-    pub fn with_cors(mut self, cors: &Cors) -> Result<Self> {
-        cors.apply_headers(self.headers_mut())?;
-        Ok(self)
+    pub fn with_cors(self, cors: &Cors) -> Result<Self> {
+        let mut headers = self.headers.clone();
+        cors.apply_headers(&mut headers)?;
+        Ok(self.with_headers(headers))
     }
 
     /// Sets this response's `webSocket` option.

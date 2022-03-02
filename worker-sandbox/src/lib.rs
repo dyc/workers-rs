@@ -1,4 +1,7 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use blake2::{Blake2b, Digest};
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use worker::*;
 
@@ -59,10 +62,21 @@ async fn handle_async_request<D>(req: Request, _ctx: RouteContext<D>) -> Result<
     ))
 }
 
-#[event(fetch)]
-pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
+static GLOBAL_STATE: AtomicBool = AtomicBool::new(false);
+
+// We're able to specify a start event that is called when the WASM is initialized before any
+// requests. This is useful if you have some global state or setup code, like a logger. This is
+// only called once for the entire lifetime of the worker.
+#[event(start)]
+pub fn start() {
     utils::set_panic_hook();
 
+    // Change some global state so we know that we ran our setup function.
+    GLOBAL_STATE.store(true, Ordering::SeqCst);
+}
+
+#[event(fetch)]
+pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
     let data = SomeSharedData {
         regex: regex::Regex::new(r"^\d{4}-\d{2}-\d{2}$").unwrap(),
     };
@@ -72,32 +86,73 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
     router
         .get("/request", handle_a_request) // can pass a fn pointer to keep routes tidy
         .get_async("/async-request", handle_async_request)
-        .get("/websocket", |_, _| {
+        .get("/websocket", |_, ctx| {
             // Accept / handle a websocket connection
             let pair = WebSocketPair::new()?;
             let server = pair.server;
             server.accept()?;
-            server.send_with_str("Hi")?;
-            server.send_with_str("Other message")?;
-            let inner_server = server.clone();
-            server.on_message_async(move |event| {
-                let server = inner_server.clone();
-                async move {
-                    server
-                        .send_with_str(event.get_data().as_string().unwrap())
-                        .unwrap();
-                    console_log!("Message received");
+
+            let some_namespace_kv = ctx.kv("SOME_NAMESPACE")?;
+
+            wasm_bindgen_futures::spawn_local(async move {
+                let mut event_stream = server.events().expect("could not open stream");
+
+                while let Some(event) = event_stream.next().await {
+                    match event.expect("received error in websocket") {
+                        WebsocketEvent::Message(msg) => {
+                            if let Some(text) = msg.text() {
+                                server.send_with_str(text).expect("could not relay text");
+                            }
+                        }
+                        WebsocketEvent::Close(_) => {
+                            // Sets a key in a test KV so the integration tests can query if we
+                            // actually got the close event. We can't use the shared dat a for this
+                            // because miniflare resets that every request.
+                            some_namespace_kv
+                                .put("got-close-event", "true")
+                                .unwrap()
+                                .execute()
+                                .await
+                                .unwrap();
+                        }
+                    }
                 }
-            })?;
-            server.on_close(|close| {
-                console_log!("{:?}", close);
-            })?;
-            server.on_error(|error| {
-                console_log!("{:?}", error);
-            })?;
-            Ok(Response::empty()?
-                .with_status(101)
-                .with_websocket(Some(pair.client)))
+            });
+
+            Response::from_websocket(pair.client)
+        })
+        .get_async("/got-close-event", |_, ctx| async move {
+            let some_namespace_kv = ctx.kv("SOME_NAMESPACE")?;
+            let got_close_event = some_namespace_kv
+                .get("got-close-event")
+                .text()
+                .await?
+                .unwrap_or_else(|| "false".into());
+
+            // Let the integration tests have some way of knowing if we successfully received the closed event.
+            Response::ok(got_close_event)
+        })
+        .get_async("/ws-client", |_, _| async move {
+            let ws = WebSocket::connect("wss://echo.zeb.workers.dev/".parse()?).await?;
+
+            // It's important that we call this before we send our first message, otherwise we will
+            // not have any event listeners on the socket to receive the echoed message.
+            let mut event_stream = ws.events()?;
+
+            ws.accept()?;
+            ws.send_with_str("Hello, world!")?;
+
+            while let Some(event) = event_stream.next().await {
+                let event = event?;
+
+                if let WebsocketEvent::Message(msg) = event {
+                    if let Some(text) = msg.text() {
+                        return Response::ok(text);
+                    }
+                }
+            }
+
+            Response::error("never got a message echoed back :(", 500)
         })
         .get("/test-data", |_, ctx| {
             // just here to test data works
@@ -106,6 +161,19 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             } else {
                 Response::error("bad match", 500)
             }
+        })
+        .post("/xor/:num", |mut req, ctx| {
+            let num: u8 = match ctx.param("num").unwrap().parse() {
+                Ok(num) => num,
+                Err(_) => return Response::error("invalid byte", 400),
+            };
+
+            let xor_stream = req.stream()?.map_ok(move |mut buf| {
+                buf.iter_mut().for_each(|x| *x ^= num);
+                buf
+            });
+
+            Response::from_stream(xor_stream)
         })
         .post("/headers", |req, _ctx| {
             let mut headers: http::HeaderMap = req.headers().into();
@@ -367,6 +435,10 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
         })
         .get("/custom-response-body", |_, _| {
             Response::from_body(ResponseBody::Body(vec![b'h', b'e', b'l', b'l', b'o']))
+        })
+        .get("/init-called", |_, _| {
+            let init_called = GLOBAL_STATE.load(Ordering::SeqCst);
+            Response::ok(init_called.to_string())
         })
         .or_else_any_method_async("/*catchall", |_, ctx| async move {
             console_log!(
