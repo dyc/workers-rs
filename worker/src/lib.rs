@@ -1,6 +1,7 @@
 #![allow(clippy::new_without_default)]
 #![allow(clippy::or_fun_call)]
 
+mod cache;
 mod cf;
 mod context;
 mod cors;
@@ -24,6 +25,7 @@ use std::result::Result as StdResult;
 
 pub type Result<T> = StdResult<T, error::Error>;
 
+pub use crate::cache::Cache;
 pub use crate::context::Context;
 pub use crate::cors::Cors;
 pub use crate::date::{Date, DateInit};
